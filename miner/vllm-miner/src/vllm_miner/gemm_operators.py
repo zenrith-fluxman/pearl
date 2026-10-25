@@ -54,12 +54,18 @@ class _JobConstants:
 _JOB_CONSTANTS: dict[tuple[int, int], _JobConstants] = {}
 _JOB_CONSTANTS_FOR: list[tuple | None] = [None]
 
+# The weights' tensor hash depends only on the weights and the job's hash key, so it is kept for
+# the current job, per layer. Only weights that come with their layer (vLLM's path) are cached:
+# the layer object pins their identity, so a freed-and-reused address can never hit the cache.
+_WEIGHT_HASHES: dict[tuple, torch.Tensor] = {}
+
 
 def get_job_constants(mining_job, matmul_config, k: int, noise_rank: int) -> _JobConstants:
     job_identity = (mining_job.incomplete_header_bytes, mining_job.target, mining_job.cert_version)
 
     if _JOB_CONSTANTS_FOR[0] != job_identity:
         _JOB_CONSTANTS.clear()
+        _WEIGHT_HASHES.clear()
         _JOB_CONSTANTS_FOR[0] = job_identity
 
     constants = _JOB_CONSTANTS.get((k, noise_rank))
@@ -75,6 +81,21 @@ def get_job_constants(mining_job, matmul_config, k: int, noise_rank: int) -> _Jo
         _JOB_CONSTANTS[(k, noise_rank)] = constants
 
     return constants
+
+
+def hash_weights(B, layer, key_tensor, scratchpad, k: int, noise_rank: int) -> torch.Tensor:
+    cache_key = (id(layer), B.data_ptr(), tuple(B.shape), k, noise_rank) if layer is not None else None
+
+    if cache_key is not None and cache_key in _WEIGHT_HASHES:
+        return _WEIGHT_HASHES[cache_key]
+
+    B_tensor_hash = torch.empty(32, device="cuda", dtype=torch.uint8)
+    tensor_hash(B.view(torch.uint8), key_tensor, B_tensor_hash, scratchpad)
+
+    if cache_key is not None:
+        _WEIGHT_HASHES[cache_key] = B_tensor_hash
+
+    return B_tensor_hash
 
 
 def pearl_gemm_vanilla(
@@ -176,13 +197,7 @@ def pearl_gemm_noisy(
         tensor_hash_scratchpad,
     )
 
-    B_tensor_hash = torch.empty(32, device="cuda", dtype=torch.uint8)
-    tensor_hash(
-        B.view(torch.uint8),
-        key_tensor,
-        B_tensor_hash,
-        tensor_hash_scratchpad,
-    )
+    B_tensor_hash = hash_weights(B, layer, key_tensor, tensor_hash_scratchpad, k, r)
 
     # Generate commitment hashes for noise generation.
     commitment_hash_A_tensor = torch.empty(32, device="cuda", dtype=torch.uint8)
