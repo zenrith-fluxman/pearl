@@ -24,6 +24,20 @@ from .mining_state import (
 
 _LOGGER = get_logger("vllm.pearl_miner")
 
+# GPUMatmulConfigFactory.create re-reads MinerSettings from the environment on every call; the
+# result depends only on (k, noise_rank) and settings that are fixed for the process lifetime.
+_MATMUL_CONFIGS: dict[tuple[int, int], object] = {}
+
+
+def get_matmul_config(k: int, noise_rank: int):
+    matmul_config = _MATMUL_CONFIGS.get((k, noise_rank))
+
+    if matmul_config is None:
+        matmul_config = GPUMatmulConfigFactory.create(k=k, noise_rank=noise_rank)
+        _MATMUL_CONFIGS[(k, noise_rank)] = matmul_config
+
+    return matmul_config
+
 
 def pearl_gemm_vanilla(
     A: torch.Tensor,
@@ -107,7 +121,7 @@ def pearl_gemm_noisy(
         dtype=torch.uint8,
         device=a.device,
     )
-    matmul_config = GPUMatmulConfigFactory.create(k=k, noise_rank=r)
+    matmul_config = get_matmul_config(k, r)
 
     # Get current mining job from shared state
     mining_job = get_async_manager().get_mining_job()
