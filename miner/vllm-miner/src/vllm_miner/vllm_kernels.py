@@ -26,9 +26,68 @@ from .config import config
 from .gemm_operators import pearl_gemm_noisy, pearl_gemm_vanilla
 from .mining_state import get_async_manager
 from .quantization_operators import NO_HADAMARD_BLOCK_SIZE, quant_7bit, quant_8bit
+from vllm.utils.torch_utils import direct_register_custom_op
 
 _LOGGER = get_logger("vllm.pearl_miner")
 
+
+
+
+# The Pearl linear (quantize, pick noisy or vanilla GEMM by size, multiply) as one opaque custom op.
+# torch.compile cannot trace the CuTe-DSL quantize kernel nor the size-dependent Python choice, so
+# without this vLLM can only run Pearl with --enforce-eager (no torch.compile, no CUDA graphs).
+# Inside the op everything runs eagerly; the compiler only sees the output shape.
+def _pearl_apply_linear(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    smooth_scale: torch.Tensor | None,
+    hadamard_block_size: int,
+    layer_key: int,
+    mining: bool,
+) -> torch.Tensor:
+    if not mining:
+        x_q, x_s, _ = quant_8bit(x, smooth_scale=smooth_scale, block_size=hadamard_block_size)
+        return pearl_gemm_vanilla(
+            x_q.contiguous(), w_q.contiguous(), scale_a=x_s.squeeze(-1), scale_b=w_s.squeeze(-1), out_dtype=x.dtype
+        )
+
+    x_q, x_s, _ = quant_7bit(x, smooth_scale=smooth_scale, block_size=hadamard_block_size)
+    m, k, n = x_q.shape[0], x_q.shape[1], w_q.shape[0]
+
+    if config.should_use_noisy_gemm(m, n, k) and not config.settings.no_mining:
+        return pearl_gemm_noisy(
+            x_q.contiguous(),
+            w_q.contiguous(),
+            scale_a=x_s.squeeze(-1),
+            scale_b=w_s.squeeze(-1),
+            out_dtype=x.dtype,
+            submit_block=not get_async_manager()._conf.skip_block_submission,
+            layer_key=layer_key,
+        )
+
+    return pearl_gemm_vanilla(
+        x_q.contiguous(), w_q.contiguous(), scale_a=x_s.squeeze(-1), scale_b=w_s.squeeze(-1), out_dtype=x.dtype
+    )
+
+
+def _pearl_apply_linear_fake(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    smooth_scale: torch.Tensor | None,
+    hadamard_block_size: int,
+    layer_key: int,
+    mining: bool,
+) -> torch.Tensor:
+    return torch.empty((x.shape[0], w_q.shape[0]), dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="pearl_apply_linear",
+    op_func=_pearl_apply_linear,
+    fake_impl=_pearl_apply_linear_fake,
+)
 
 class PearlKernel(Int8ScaledMMLinearKernel):
     """
@@ -98,6 +157,10 @@ class PearlKernel(Int8ScaledMMLinearKernel):
 
         :param layer: Neural network layer containing weights to process
         """
+        # A plain int naming this layer, read by the compiled forward as a constant (the custom op
+        # cannot take the module itself); keys the per-layer weight-hash cache.
+        layer._pearl_layer_key = id(layer)
+
         # WEIGHT
         # Pearl GEMM kernels expect non-transposed weights
         weight = getattr(layer, self.w_q_name)
@@ -175,14 +238,9 @@ class PearlKernel(Int8ScaledMMLinearKernel):
         if hasattr(layer, "smooth_quant_scale") and layer.smooth_quant_scale is not None:
             smooth_scale = layer.smooth_quant_scale
 
-        if self.mining_enabled:
-            return self._apply_weights_mining(
-                layer, x, w_q, w_s, smooth_scale, layer._hadamard_block_size, bias
-            )
-        else:
-            return self._apply_weights_non_mining(
-                layer, x, w_q, w_s, smooth_scale, layer._hadamard_block_size, bias
-            )
+        return torch.ops.vllm.pearl_apply_linear(
+            x, w_q, w_s, smooth_scale, layer._hadamard_block_size, layer._pearl_layer_key, self.mining_enabled
+        )
 
     def _apply_weights_mining(
         self,

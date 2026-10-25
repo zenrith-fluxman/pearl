@@ -83,8 +83,8 @@ def get_job_constants(mining_job, matmul_config, k: int, noise_rank: int) -> _Jo
     return constants
 
 
-def hash_weights(B, layer, key_tensor, scratchpad, k: int, noise_rank: int) -> torch.Tensor:
-    cache_key = (id(layer), B.data_ptr(), tuple(B.shape), k, noise_rank) if layer is not None else None
+def hash_weights(B, layer_key: int | None, key_tensor, scratchpad, k: int, noise_rank: int) -> torch.Tensor:
+    cache_key = (layer_key, B.data_ptr(), tuple(B.shape), k, noise_rank) if layer_key is not None else None
 
     if cache_key is not None and cache_key in _WEIGHT_HASHES:
         return _WEIGHT_HASHES[cache_key]
@@ -146,6 +146,7 @@ def pearl_gemm_noisy(
     out_dtype: torch.dtype,
     layer: torch.nn.Module | None = None,
     submit_block: bool = True,
+    layer_key: int | None = None,
 ) -> torch.Tensor:
     """
     Performs quantized matrix multiplication with cryptographic noise for blockchain mining.
@@ -197,7 +198,9 @@ def pearl_gemm_noisy(
         tensor_hash_scratchpad,
     )
 
-    B_tensor_hash = hash_weights(B, layer, key_tensor, tensor_hash_scratchpad, k, r)
+    if layer_key is None and layer is not None:
+        layer_key = id(layer)
+    B_tensor_hash = hash_weights(B, layer_key, key_tensor, tensor_hash_scratchpad, k, r)
 
     # Generate commitment hashes for noise generation.
     commitment_hash_A_tensor = torch.empty(32, device="cuda", dtype=torch.uint8)
