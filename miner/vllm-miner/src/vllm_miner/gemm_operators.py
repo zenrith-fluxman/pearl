@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import torch
 from miner_base.commitment_hash import CommitmentHasher
 from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
@@ -37,6 +39,42 @@ def get_matmul_config(k: int, noise_rank: int):
         _MATMUL_CONFIGS[(k, noise_rank)] = matmul_config
 
     return matmul_config
+
+
+@dataclass
+class _JobConstants:
+    adjusted_target: int
+    key_tensor: torch.Tensor
+    pow_target_tensor: torch.Tensor
+
+
+# What depends only on the mining job and (k, noise_rank): the rank-penalized target, the hash
+# key and their GPU copies. Rebuilt whenever the job's contents change; the job object itself is
+# replaced every second even when nothing changed, so it is compared by value.
+_JOB_CONSTANTS: dict[tuple[int, int], _JobConstants] = {}
+_JOB_CONSTANTS_FOR: list[tuple | None] = [None]
+
+
+def get_job_constants(mining_job, matmul_config, k: int, noise_rank: int) -> _JobConstants:
+    job_identity = (mining_job.incomplete_header_bytes, mining_job.target, mining_job.cert_version)
+
+    if _JOB_CONSTANTS_FOR[0] != job_identity:
+        _JOB_CONSTANTS.clear()
+        _JOB_CONSTANTS_FOR[0] = job_identity
+
+    constants = _JOB_CONSTANTS.get((k, noise_rank))
+
+    if constants is None:
+        adjusted_target = mining_job.adjust_target(mining_config=matmul_config.mining_config)
+        hash_key = CommitmentHasher.get_key(mining_job.incomplete_header_bytes, matmul_config.mining_config)
+        constants = _JobConstants(
+            adjusted_target=adjusted_target,
+            key_tensor=torch.frombuffer(bytearray(hash_key), dtype=torch.uint8).to("cuda"),
+            pow_target_tensor=make_pow_target_tensor(adjusted_target),
+        )
+        _JOB_CONSTANTS[(k, noise_rank)] = constants
+
+    return constants
 
 
 def pearl_gemm_vanilla(
@@ -126,14 +164,9 @@ def pearl_gemm_noisy(
     # Get current mining job from shared state
     mining_job = get_async_manager().get_mining_job()
 
-    # Calculate adjusted pow_target
-    adjusted_target = mining_job.adjust_target(mining_config=matmul_config.mining_config)
-
-    hash_key = CommitmentHasher.get_key(
-        mining_job.incomplete_header_bytes, matmul_config.mining_config
-    )
-
-    key_tensor = torch.frombuffer(bytearray(hash_key), dtype=torch.uint8).to("cuda")
+    # Target, hash key and their GPU copies, computed once per mining job
+    job_constants = get_job_constants(mining_job, matmul_config, k, r)
+    key_tensor = job_constants.key_tensor
 
     A_tensor_hash = torch.empty(32, device="cuda", dtype=torch.uint8)
     tensor_hash(
@@ -195,8 +228,7 @@ def pearl_gemm_noisy(
     host_signal_sync = torch.zeros((host_signal_sync_size,), dtype=torch.int8, device="cuda")
     host_signal_header_pinned = get_pinned_pool().acquire()
 
-    # Create pow_target tensor from adjusted_target
-    pow_target_tensor = make_pow_target_tensor(adjusted_target)
+    pow_target_tensor = job_constants.pow_target_tensor
 
     # Run noisy GEMM with default kernel configurations
     noisy_gemm(
