@@ -214,6 +214,11 @@ def pearl_gemm_noisy(
         salted_dims=(m, n) if mining_job.cert_version.uses_salted_seeds else None,
     )
 
+    # int32 denoising factors let the noising kernels split K; noise_gen zeroes them
+    denoise_int32 = torch.empty((m + n) * r, dtype=torch.int32, device=a.device)
+    AxEBL_int32 = denoise_int32[: m * r].view(m, r)
+    EARxBpEB_int32 = denoise_int32[m * r :].view(n, r)
+
     # Generate noise factors from commitment hashes
     (
         EAL,
@@ -232,6 +237,7 @@ def pearl_gemm_noisy(
         commitment_hash_A_tensor,
         commitment_hash_B_tensor,
         a.device,
+        aux_buffer=denoise_int32,
     )
 
     # Always compute B noising (depends on A through EAR)
@@ -262,6 +268,8 @@ def pearl_gemm_noisy(
         EBL_K_major=EBL_K_major,
         AxEBL_fp16=A_E_BL,  # Intermediate tensor A * E_BL (m x r)
         EARxBpEB_fp16=EARxBpEB,  # Output tensor for EAR * BpEB (n x r)
+        AxEBL_int32=AxEBL_int32,  # Split-K noising A output, converted to AxEBL_fp16
+        EARxBpEB_int32=EARxBpEB_int32,  # Split-K noising B output, converted to EARxBpEB_fp16
         ApEA=ApEA,  # Output tensor for A + EA (m x k)
         BpEB=BpEB,  # Output tensor for B + EB (n x k)
         A_scales=A_scales,  # Scale factors for A
@@ -325,6 +333,9 @@ def pearl_gemm_noisy(
     del tensor_hash_scratchpad
     del host_signal_sync
     del EARxBpEB
+    del AxEBL_int32
+    del EARxBpEB_int32
+    del denoise_int32
     return C
 
 
@@ -336,6 +347,7 @@ def generate_noise_factors(
     commitment_hash_A: torch.Tensor,
     commitment_hash_B: torch.Tensor,
     device: torch.device,
+    aux_buffer: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -359,6 +371,7 @@ def generate_noise_factors(
     :param commitment_hash_A: Cryptographic hash for matrix A noise generation
     :param commitment_hash_B: Cryptographic hash for matrix B noise generation
     :param device: CUDA device for tensor allocation
+    :param aux_buffer: Optional int32 buffer for noise_gen to zero-initialise
     :return: Tuple of noise tensors (EAL, EAR_R_major, EBL_R_major,
              EAR_K_major, EBL_K_major, EBR, EAL_fp16, EBR_fp16)
     """
@@ -384,6 +397,7 @@ def generate_noise_factors(
         EBR_fp16=EBR_fp16,
         key_A=commitment_hash_A,
         key_B=commitment_hash_B,
+        aux_buffer=aux_buffer,
     )
     return (
         EAL,
