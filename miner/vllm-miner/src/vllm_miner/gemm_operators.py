@@ -26,6 +26,9 @@ from .mining_state import (
 
 _LOGGER = get_logger("vllm.pearl_miner")
 
+# Load/store pipeline depth of the int32 noising A/B kernels (see default_compiled_kernels.py).
+_NOISING_STAGES = 4
+
 # GPUMatmulConfigFactory.create re-reads MinerSettings from the environment on every call; the
 # result depends only on (k, noise_rank) and settings that are fixed for the process lifetime.
 _MATMUL_CONFIGS: dict[tuple[int, int], object] = {}
@@ -282,6 +285,8 @@ def pearl_gemm_noisy(
         tile_size_m=config.settings.tile_size_m,
         tile_size_n=config.settings.tile_size_n,
         tile_size_k=config.settings.tile_size_k,
+        pipeline_stages_noising_A=_NOISING_STAGES,
+        pipeline_stages_noising_B=_NOISING_STAGES,
         run_noising_A=True,  # run_noising_A
         run_noising_B=True,  # run_noising_B
         skip_reduction=False,  # skip_reduction

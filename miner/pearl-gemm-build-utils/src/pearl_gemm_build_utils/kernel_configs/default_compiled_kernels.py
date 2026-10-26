@@ -42,6 +42,18 @@ _noising_a_kernels = [
     for dtype in ["fp16", "int32"]
 ]
 
+# Noising A: 64x64, int32, stage=4 (deeper pipeline used by the vLLM miner)
+_noising_a_kernels += [
+    NoisingAKernelConfig(
+        tile_size_m=64,
+        tile_size_k=64,
+        R=R,
+        pipeline_stages=4,
+        AxEBL_type="int32",
+    )
+    for R in [64, 128]
+]
+
 # Noising B: 64x64, fp16/int32
 _noising_b_kernels = [
     NoisingBKernelConfig(
@@ -53,6 +65,18 @@ _noising_b_kernels = [
     )
     for R in [64, 128]
     for dtype in ["fp16", "int32"]
+]
+
+# Noising B: 64x64, int32, stage=4 (deeper pipeline used by the vLLM miner)
+_noising_b_kernels += [
+    NoisingBKernelConfig(
+        tile_size_n=64,
+        tile_size_k=64,
+        R=R,
+        pipeline_stages=4,
+        EARxBpEB_type="int32",
+    )
+    for R in [64, 128]
 ]
 
 KERNEL_CONFIGS = KernelCompilationGrid(
