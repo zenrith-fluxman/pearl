@@ -30,21 +30,15 @@ using u8 = uint8_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
 
-void set_key(const uint8_t d_key[blake3::KEY_SIZE]) {
-  gpuErrchk(cudaMemcpyToSymbol(c_key, d_key, blake3::KEY_SIZE, 0,
-                               cudaMemcpyDeviceToDevice));
-}
-
 // Launch a specific MerkleTreeRootsKernel instantiation.
 template <typename MerkleTreeRootsKernel>
 void launch_merkle_tree_roots(const uint8_t* data, uint32_t data_len,
-                              uint8_t* roots, cudaStream_t stream) {
+                              uint8_t* roots, const uint8_t* key, uint8_t* out,
+                              cudaStream_t stream) {
   constexpr static int merkle_roots_smem_size =
       MerkleTreeRootsKernel::SharedStorageSize;
   typename MerkleTreeRootsKernel::Arguments args{
-      data,
-      data_len,
-      roots,
+      data, data_len, roots, key, out,
   };
   typename MerkleTreeRootsKernel::Params kernel_params =
       MerkleTreeRootsKernel::to_underlying_arguments(args);
@@ -70,23 +64,26 @@ void tensor_hash_impl(const uint8_t* data, uint32_t data_size, uint8_t* out,
                       const uint8_t key[blake3::KEY_SIZE], uint32_t num_blocks,
                       uint8_t* roots, cudaDeviceProp& deviceProp,
                       cudaStream_t stream) {
-  set_key(key);
+  // The kernels read the key straight from global memory, and the kernel that
+  // produces the final root also writes it to `out`.
   const u32 data_len = data_size;
 
   // When the whole input fits in a single block, the roots kernel produces the
   // final digest and must apply BLAKE3's ROOT flag itself (kApplyRoot=true).
   // Dispatching on a compile-time flag keeps the common multi-block kernel
   // identical to the original (no ROOT) code path, so there is no slowdown.
+  // That kernel writes the digest to `out`; with a single root there is nothing
+  // left to reduce, so we are done.
   if (num_blocks == 1) {
     launch_merkle_tree_roots<pearl::MerkleTreeRootsKernel<
         kNumConsumerThreads, kNumStages, kThreadLoadSize, /*kApplyRoot=*/true>>(
-        data, data_len, roots, stream);
-  } else {
-    launch_merkle_tree_roots<
-        pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kNumStages,
-                                     kThreadLoadSize, /*kApplyRoot=*/false>>(
-        data, data_len, roots, stream);
+        data, data_len, roots, key, out, stream);
+    return;
   }
+  launch_merkle_tree_roots<
+      pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kNumStages,
+                                   kThreadLoadSize, /*kApplyRoot=*/false>>(
+      data, data_len, roots, key, /*out=*/nullptr, stream);
 
   // 4. Compute MT as per BLAKE structure on global
   // We do this in two steps:
@@ -102,6 +99,8 @@ void tensor_hash_impl(const uint8_t* data, uint32_t data_size, uint8_t* out,
     typename ComputeBlakeMTKernel::Arguments args2{
         reinterpret_cast<uint32_t*>(roots),
         num_blocks,
+        key,
+        out,
     };
     typename ComputeBlakeMTKernel::Params kernel_params2 =
         ComputeBlakeMTKernel::to_underlying_arguments(args2);
@@ -124,6 +123,8 @@ void tensor_hash_impl(const uint8_t* data, uint32_t data_size, uint8_t* out,
     typename ComputeBlakeMTKernel::Arguments args2{
         reinterpret_cast<uint32_t*>(roots),
         num_blocks,
+        key,
+        /*out=*/nullptr,
     };
     typename ComputeBlakeMTKernel::Params kernel_params2 =
         ComputeBlakeMTKernel::to_underlying_arguments(args2);
@@ -149,6 +150,8 @@ void tensor_hash_impl(const uint8_t* data, uint32_t data_size, uint8_t* out,
     typename ReduceRootsKernel::Arguments args3{
         reinterpret_cast<uint32_t*>(roots),
         static_cast<uint32_t>(num_blocks_for_mt),
+        key,
+        out,
     };
 
     typename ReduceRootsKernel::Params kernel_params3 =
@@ -171,9 +174,6 @@ void tensor_hash_impl(const uint8_t* data, uint32_t data_size, uint8_t* out,
         kernel_params3);
     gpuErrchk(cudaGetLastError());
   }
-
-  gpuErrchk(cudaMemcpyAsync(out, roots, blake3::CHAINING_VALUE_SIZE,
-                            cudaMemcpyDeviceToDevice, stream));
 }
 
 // Dispatch helper for pipeline stages

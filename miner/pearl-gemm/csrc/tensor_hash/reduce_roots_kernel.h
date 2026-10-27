@@ -29,15 +29,19 @@ class ReduceRootsKernel {
   struct Arguments {
     Element* ptr_roots;
     const uint32_t num_leaves;  // how many leaves do we reduce?
+    const uint8_t* ptr_key;     // 32-byte BLAKE3 key in GMEM
+    uint8_t* ptr_out;           // Final digest
   };
 
   struct Params {
     Element* ptr_roots;
     const uint32_t num_leaves;  // how many leaves do we reduce?
+    const uint8_t* ptr_key;
+    uint8_t* ptr_out;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
-    return Params{args.ptr_roots, args.num_leaves};
+    return Params{args.ptr_roots, args.num_leaves, args.ptr_key, args.ptr_out};
   }
 
   static dim3 get_grid_shape(Params const& params) { return dim3(1); }
@@ -61,18 +65,22 @@ class ReduceRootsKernel {
     if (tid < params.num_leaves) {
       copy(mLeaves(_, tid), sLeaves(_, tid));
     }
+    uint32_t rKey[blake3::CHAINING_VALUE_SIZE_U32];
+    load_key(params.ptr_key, rKey);
     // Synchronize before starting the reduction
     __syncthreads();
     // And run the Merkle Tree reduction
     if (__popc(params.num_leaves) == 1) {
-      merkle_tree_utils::compute_perfect_mt<true>(sLeaves, params.num_leaves);
+      merkle_tree_utils::compute_perfect_mt<true>(sLeaves, params.num_leaves,
+                                                  rKey);
     } else {
-      merkle_tree_utils::compute_blake_mt<true>(sLeaves, params.num_leaves);
+      merkle_tree_utils::compute_blake_mt<true>(sLeaves, params.num_leaves, rKey);
     }
     // Copy the result back from smem -> gmem
     // Use the first 8 threads to write back the 8 uint32_t values in parallel
     if (tid < blake3::CHAINING_VALUE_SIZE_U32) {
       *((uint32_t*)params.ptr_roots + tid) = sLeaves(tid, 0);
+      store_digest_word(params.ptr_out, tid, sLeaves(tid, 0));
     }
   }
 };

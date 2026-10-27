@@ -30,16 +30,20 @@ class ComputeBlakeMTKernel {
     Element* ptr_roots;  // pointer to GMEM
     const uint32_t
         num_blocks;  // how many blocks do we need to reduce in total?
+    const uint8_t* ptr_key;  // 32-byte BLAKE3 key in GMEM
+    uint8_t* ptr_out;  // Final digest; only written when IsSingleBlock
   };
 
   struct Params {
     Element* ptr_roots;  // pointer to GMEM
     const uint32_t
         num_blocks;  // how many blocks do we need to reduce in total?
+    const uint8_t* ptr_key;
+    uint8_t* ptr_out;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
-    return Params{args.ptr_roots, args.num_blocks};
+    return Params{args.ptr_roots, args.num_blocks, args.ptr_key, args.ptr_out};
   }
 
   static dim3 get_grid_shape(Params const& params) {
@@ -86,6 +90,8 @@ class ComputeBlakeMTKernel {
     if (tid < num_leaves) {
       copy(mLeaves(_, offset + tid), sLeaves(_, tid));
     }
+    uint32_t rKey[blake3::CHAINING_VALUE_SIZE_U32];
+    load_key(params.ptr_key, rKey);
     __syncthreads();
 
     // Compute our Merkle Tree's root.
@@ -95,15 +101,15 @@ class ComputeBlakeMTKernel {
 
     if (use_blake_mt) {
       if constexpr (IsSingleBlock) {
-        merkle_tree_utils::compute_blake_mt<true>(sLeaves, num_leaves);
+        merkle_tree_utils::compute_blake_mt<true>(sLeaves, num_leaves, rKey);
       } else {
-        merkle_tree_utils::compute_blake_mt<false>(sLeaves, num_leaves);
+        merkle_tree_utils::compute_blake_mt<false>(sLeaves, num_leaves, rKey);
       }
     } else {
       if constexpr (IsSingleBlock) {
-        merkle_tree_utils::compute_perfect_mt<true>(sLeaves, num_leaves);
+        merkle_tree_utils::compute_perfect_mt<true>(sLeaves, num_leaves, rKey);
       } else {
-        merkle_tree_utils::compute_perfect_mt<false>(sLeaves, num_leaves);
+        merkle_tree_utils::compute_perfect_mt<false>(sLeaves, num_leaves, rKey);
       }
     }
     __syncthreads();
@@ -120,6 +126,10 @@ class ComputeBlakeMTKernel {
       u32* roots_u32_ptr = reinterpret_cast<u32*>(roots_byte_ptr + base_offset +
                                                   tid * sizeof(uint32_t));
       *roots_u32_ptr = sLeaves(tid, 0);
+      // The single block's root is the final digest: write it to out directly.
+      if constexpr (IsSingleBlock) {
+        store_digest_word(params.ptr_out, tid, sLeaves(tid, 0));
+      }
     }
   }
 };

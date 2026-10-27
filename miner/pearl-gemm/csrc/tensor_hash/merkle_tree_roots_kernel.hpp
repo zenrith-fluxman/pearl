@@ -226,12 +226,16 @@ class MerkleTreeRootsKernel {
     const Element* ptr_data;
     const u32 data_len;  // Data length in bytes
     Element* ptr_roots;
+    const uint8_t* ptr_key;  // 32-byte BLAKE3 key in GMEM
+    uint8_t* ptr_out;  // Final digest; only written when kApplyRoot
   };
 
   struct alignas(128) Params {
     const Element* ptr_data;
     u32 data_len;  // Data length in bytes
     Element* ptr_roots;
+    const uint8_t* ptr_key;
+    uint8_t* ptr_out;
     TMA_A tma_load_A;
   };
 
@@ -255,6 +259,8 @@ class MerkleTreeRootsKernel {
     params.ptr_data = args.ptr_data;
     params.data_len = args.data_len;
     params.ptr_roots = args.ptr_roots;
+    params.ptr_key = args.ptr_key;
+    params.ptr_out = args.ptr_out;
 
     const u32 num_full_chunks = compute_num_full_chunks(args.data_len);
     // cuTensorMapEncodeTiled requires extents >= 1. When there is no full chunk
@@ -503,24 +509,33 @@ class MerkleTreeRootsKernel {
                                          : chunks_in_this_block;
     }();
 
+    uint32_t rKey[blake3::CHAINING_VALUE_SIZE_U32];
+    load_key(params.ptr_key, rKey);
+
     // Reduce into a Merkle Tree (all threads participate for __syncthreads)
     // Choose algorithm based on whether num_leaves is a power of 2
     if (!is_last_block) {
       // Non-last blocks always have power-of-2 leaves (kNumConsumerThreads is power of 2)
-      merkle_tree_utils::compute_perfect_mt<false>(sLeaves,
-                                                   kNumConsumerThreads);
+      merkle_tree_utils::compute_perfect_mt<false>(
+          sLeaves, kNumConsumerThreads, rKey);
     } else if ((num_leaves & (num_leaves - 1)) == 0) {
       // Last block, power of 2: use perfect merkle tree.
       // If this is the only block, the final parent compression must apply ROOT.
-      merkle_tree_utils::compute_perfect_mt<kApplyRoot>(sLeaves, num_leaves);
+      merkle_tree_utils::compute_perfect_mt<kApplyRoot>(sLeaves, num_leaves,
+                                                        rKey);
     } else {
       // Last block, not a power of 2: use BLAKE3's merkle tree structure.
-      merkle_tree_utils::compute_blake_mt<kApplyRoot>(sLeaves, num_leaves);
+      merkle_tree_utils::compute_blake_mt<kApplyRoot>(sLeaves, num_leaves,
+                                                      rKey);
     }
 
     // Copy the root to the output (use first 8 threads)
     if (tid < blake3::CHAINING_VALUE_SIZE_U32) {
       mRoots(tid, blockIdx.x) = sLeaves(tid, 0);
+      // The single CTA's root is the final digest: write it to out directly.
+      if constexpr (kApplyRoot) {
+        store_digest_word(params.ptr_out, tid, sLeaves(tid, 0));
+      }
     }
   }
 
@@ -718,10 +733,10 @@ class MerkleTreeRootsKernel {
     // Register tensor (chaining value) of our hash's state
     Tensor rChainingValue = make_tensor<uint32_t>(RmemLayoutChainingValue{});
 
-    // Initialize chaining value with c_key
+    // Initialize chaining value with the key
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < blake3::CHAINING_VALUE_SIZE_U32; ++i) {
-      rChainingValue(i) = c_key[i];
+      rChainingValue(i) = load_key_word(params.ptr_key, i);
     }
 
     // Calculate if this thread is processing the last (potentially partial) chunk
@@ -792,10 +807,10 @@ class MerkleTreeRootsKernel {
     // Register tensor (chaining value) of our hash's state
     Tensor rChainingValue = make_tensor<uint32_t>(RmemLayoutChainingValue{});
 
-    // Initialize chaining value with c_key
+    // Initialize chaining value with the key
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < blake3::CHAINING_VALUE_SIZE_U32; ++i) {
-      rChainingValue(i) = c_key[i];
+      rChainingValue(i) = load_key_word(params.ptr_key, i);
     }
 
     // Calculate if this thread is processing the last (potentially partial) chunk

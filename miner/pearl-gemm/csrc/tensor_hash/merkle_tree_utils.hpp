@@ -24,8 +24,9 @@ static_assert(size(RmemLayoutChunk{}) == blake3::CHAINING_VALUE_SIZE_U32 * 2,
 
 // Compute a perfect Merkle Tree with num_leaves leaves
 template <bool ConsiderRoot, class SmemTensorLeaves>
-CUTLASS_DEVICE void compute_perfect_mt(SmemTensorLeaves const& sLeaves,
-                                       const uint32_t num_leaves) {
+CUTLASS_DEVICE void compute_perfect_mt(
+    SmemTensorLeaves const& sLeaves, const uint32_t num_leaves,
+    const uint32_t (&key)[blake3::CHAINING_VALUE_SIZE_U32]) {
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
   for (u32 level_size = num_leaves; level_size > 1; level_size >>= 1) {
@@ -33,7 +34,7 @@ CUTLASS_DEVICE void compute_perfect_mt(SmemTensorLeaves const& sLeaves,
     Tensor rChunk = make_tensor<uint32_t>(RmemLayoutChunk{});
 
     for (int i = 0; i < blake3::CHAINING_VALUE_SIZE_U32; ++i) {
-      rChainingValue(i) = c_key[i];
+      rChainingValue(i) = key[i];
     }
 
     const u32 num_pairs = level_size >> 1;
@@ -67,8 +68,9 @@ CUTLASS_DEVICE void compute_perfect_mt(SmemTensorLeaves const& sLeaves,
 }
 
 template <bool ConsiderRoot, class SmemTensorLeaves>
-CUTLASS_DEVICE void compute_blake_mt(SmemTensorLeaves const& sLeaves,
-                                     const uint32_t num_leaves) {
+CUTLASS_DEVICE void compute_blake_mt(
+    SmemTensorLeaves const& sLeaves, const uint32_t num_leaves,
+    const uint32_t (&key)[blake3::CHAINING_VALUE_SIZE_U32]) {
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
   // Each group of threads handles a perfect tree
   // Figure out which group we are part of
@@ -102,7 +104,7 @@ CUTLASS_DEVICE void compute_blake_mt(SmemTensorLeaves const& sLeaves,
     Tensor rChainingValue = make_tensor<uint32_t>(RmemLayoutChainingValue{});
 
     for (int i = 0; i < blake3::CHAINING_VALUE_SIZE_U32; ++i) {
-      rChainingValue(i) = c_key[i];
+      rChainingValue(i) = key[i];
     }
 
     const int num_pairs = curr_num_leaves >> 1;
@@ -134,7 +136,7 @@ CUTLASS_DEVICE void compute_blake_mt(SmemTensorLeaves const& sLeaves,
   if (tid == 0) {
     Tensor rChainingValue = make_tensor<uint32_t>(RmemLayoutChainingValue{});
     for (int i = 0; i < blake3::CHAINING_VALUE_SIZE_U32; ++i) {
-      rChainingValue(i) = c_key[i];
+      rChainingValue(i) = key[i];
     }
     Tensor rChunk = make_tensor<uint32_t>(RmemLayoutChunk{});
     u32 read_offset = num_leaves;
@@ -156,9 +158,9 @@ CUTLASS_DEVICE void compute_blake_mt(SmemTensorLeaves const& sLeaves,
             rChunk(j) = sLeaves(j, read_offset);
           }
 
-          // Reset chaining value to c_key before each hash
+          // Reset chaining value to key before each hash
           for (u32 j = 0; j < blake3::CHAINING_VALUE_SIZE_U32; ++j) {
-            rChainingValue(j) = c_key[j];
+            rChainingValue(j) = key[j];
           }
 
           blake3::CompressParams params =
