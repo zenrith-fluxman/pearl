@@ -209,15 +209,15 @@ __global__ void __launch_bounds__(
 
     int consumer_tix = static_cast<int>(threadIdx.x) - NumCopyThreads;
 
-    // Reduction parameters
-    bool local_block_found = 0;
-    int block_found_k_tile = 0;
-
     collective_mainloop.mma_init();
 
     WorkTileInfo work_tile_info = scheduler.get_initial_work(scheduler_params);
     CUTLASS_PRAGMA_NO_UNROLL
     while (work_tile_info.is_valid(scheduler_params)) {
+      // Reduction parameters
+      bool local_block_found = 0;
+      int block_found_k_tile = 0;
+
       // GEMM accumulator.
       Tensor tCrC = partition_fragment_C(
           tiled_mma, select<0, 1>(TileShape_MNK{}));  // (M, N)
@@ -259,6 +259,9 @@ __global__ void __launch_bounds__(
       collective_epilogue.store(epilogue_params, shared_storage, consumer_tix,
                                 block_coord);
 
+      // Lets the producer start the next worktile while we check the PoW
+      collective_epilogue.store_tail();
+
       if constexpr (!SkipReduction) {
         local_block_found = check_pow_target(transcript_extraction_tensor,
                                              mainloop_params.ptr_pow_target,
@@ -273,7 +276,6 @@ __global__ void __launch_bounds__(
         }
       }
 
-      collective_epilogue.store_tail();
       work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(
           scheduler_params, work_tile_info);
     }

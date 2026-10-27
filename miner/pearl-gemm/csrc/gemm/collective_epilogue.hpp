@@ -327,13 +327,6 @@ struct CollectiveEpilogue {
       AxEB_pipeline.producer_commit(AxEB_pipe_write, TmaTransactionBytesAxEB);
       ++AxEB_pipe_write;
     }
-
-    // Notify producer that it can load A and B for next worktile
-    cutlass::arch::fence_view_async_shared();
-    cutlass::arch::NamedBarrier::arrive(
-        kNumMmaThreads + cutlass::NumThreadsPerWarp,
-        static_cast<cutlass::arch::ReservedNamedBarriers>(
-            pearl::NamedBarriers::DenoiseComplete));
   }
 
   CUTLASS_DEVICE void load_denoise_tail(
@@ -593,7 +586,18 @@ struct CollectiveEpilogue {
     }
   }
 
-  CUTLASS_DEVICE void store_tail() { tma_store_wait<0>(); }
+  CUTLASS_DEVICE void store_tail() {
+    tma_store_wait<0>();
+    if constexpr (!KTraits::SkipDenoising) {
+      // Notify producer that it can load A and B for next worktile, since
+      //  smem C (overlapped with smem A, B) has been read by the TMA store
+      cutlass::arch::fence_view_async_shared();
+      cutlass::arch::NamedBarrier::arrive(
+          kNumMmaThreads + cutlass::NumThreadsPerWarp,
+          static_cast<cutlass::arch::ReservedNamedBarriers>(
+              pearl::NamedBarriers::DenoiseComplete));
+    }
+  }
 };
 
 }  // namespace pearl

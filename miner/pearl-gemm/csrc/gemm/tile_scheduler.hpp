@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include "cutlass/arch/barrier.h"
 #include "cutlass/fast_math.h"
 
@@ -134,6 +136,95 @@ struct SingleTileScheduler {
   CUTLASS_DEVICE WorkTileInfo
   get_next_work(Params const& params, WorkTileInfo const& current_work) const {
     return {-1, false};
+  }
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Persistent version of SingleTileScheduler: launches at most one cluster per
+// num_sm / cluster_size and strides over the same swizzled cluster order.
+struct PersistentSwizzleTileScheduler {
+
+ public:
+  // Host side kernel arguments
+  struct Arguments {
+    int const num_blocks_m, num_blocks_n, num_clusters_m, num_clusters_n,
+        swizzle;
+    bool const swizzle_n_maj;
+  };
+
+  // Device side kernel params
+  struct Params {
+    SwizzleParams const swizzle_params;
+    int const total_clusters;
+  };
+
+  static Params to_underlying_arguments(Arguments const& args) {
+    return {make_swizzle_params<Arguments>(args),
+            args.num_clusters_m * args.num_clusters_n};
+  }
+
+  static dim3 get_grid_dim(Arguments const& args, int num_sm) {
+    int const cluster_size_m = args.num_blocks_m / args.num_clusters_m;
+    int const cluster_size_n = args.num_blocks_n / args.num_clusters_n;
+    int const max_clusters =
+        std::max(num_sm / (cluster_size_m * cluster_size_n), 1);
+    int const num_clusters =
+        std::min(args.num_clusters_m * args.num_clusters_n, max_clusters);
+    return {uint32_t(num_clusters * cluster_size_m), uint32_t(cluster_size_n),
+            1};
+  }
+
+  struct WorkTileInfo {
+    int linear_cluster_idx;
+
+    CUTLASS_DEVICE
+    bool is_valid(Params const& params) const {
+      return linear_cluster_idx < params.total_clusters;
+    }
+
+    template <typename ClusterShape>
+    CUTLASS_DEVICE cute::tuple<int32_t, int32_t, int32_t> get_block_coord(
+        Params const& params) const {
+      // swizzle in units of clusters, preserving CTA layout inside each cluster
+      auto [ctaid_in_cluster_x, ctaid_in_cluster_y, ctaid_in_cluster_z] =
+          block_id_in_cluster();
+      auto [nonmaj_cluster, maj_cluster] =
+          get_coords_from_linear_idx(params.swizzle_params, linear_cluster_idx);
+      int m_cluster =
+          params.swizzle_params.swizzle_n_maj ? nonmaj_cluster : maj_cluster;
+      int n_cluster =
+          params.swizzle_params.swizzle_n_maj ? maj_cluster : nonmaj_cluster;
+      int m_block = m_cluster * size<0>(ClusterShape{}) + ctaid_in_cluster_x;
+      int n_block = n_cluster * size<1>(ClusterShape{}) + ctaid_in_cluster_y;
+      return {m_block, n_block, 1};
+    }
+  };
+
+  CUTLASS_DEVICE
+  PersistentSwizzleTileScheduler() {}
+
+  CUTLASS_DEVICE
+  WorkTileInfo get_initial_work(Params const& params) const {
+    // the grid is a single row of clusters
+    return {int(cute::cluster_id_in_grid().x)};
+  }
+
+  CUTLASS_DEVICE
+  void init_consumer() const {}
+
+  CUTLASS_DEVICE
+  void prefetch_next_work(Params const& params,
+                          WorkTileInfo& current_work) const {}
+
+  CUTLASS_DEVICE
+  void broadcast_next_work(WorkTileInfo& current_work) const {}
+
+  template <bool IsProducer = false>
+  CUTLASS_DEVICE WorkTileInfo
+  get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+    return {current_work.linear_cluster_idx +
+            int(cute::cluster_grid_dims().x)};
   }
 };
 

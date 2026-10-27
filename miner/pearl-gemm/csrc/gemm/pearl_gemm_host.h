@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <type_traits>
 #include <cute/tensor.hpp>
 
 #include "error_check.hpp"
@@ -52,8 +53,11 @@ void run_pearl_gemm(PearlAPIParams const& params, cudaStream_t stream = 0) {
   using CollectiveMainloop = pearl::CollectiveMainloop<KTraits>;
 
   using ClusterShape = typename KTraits::ClusterShape_MNK;
-  // currently only supporting SingleTileScheduler
-  using Scheduler = pearl::SingleTileScheduler;
+  // Persistent only with denoising: the DenoiseComplete barrier is what keeps
+  //  the next tile's A/B loads from overwriting the C smem union too early.
+  using Scheduler =
+      std::conditional_t<SkipDenoising, pearl::SingleTileScheduler,
+                         pearl::PersistentSwizzleTileScheduler>;
   int num_blocks_m = cutlass::ceil_div(params.m, KTraits::bM);
   int num_blocks_n = cutlass::ceil_div(params.n, KTraits::bN);
   // round if using clusters
@@ -78,13 +82,14 @@ void run_pearl_gemm(PearlAPIParams const& params, cudaStream_t stream = 0) {
   typename CollectiveMainloop::Params mainloop_params =
       CollectiveMainloop::to_underlying_arguments(mainloop_args);
 
-  Scheduler::Arguments scheduler_args = {.num_blocks_m = num_blocks_m,
-                                         .num_blocks_n = num_blocks_n,
-                                         .num_clusters_m = num_clusters_m,
-                                         .num_clusters_n = num_clusters_n,
-                                         .swizzle = swizzle,
-                                         .swizzle_n_maj = params.swizzle_n_maj};
-  Scheduler::Params scheduler_params =
+  typename Scheduler::Arguments scheduler_args = {
+      .num_blocks_m = num_blocks_m,
+      .num_blocks_n = num_blocks_n,
+      .num_clusters_m = num_clusters_m,
+      .num_clusters_n = num_clusters_n,
+      .swizzle = swizzle,
+      .swizzle_n_maj = params.swizzle_n_maj};
+  typename Scheduler::Params scheduler_params =
       Scheduler::to_underlying_arguments(scheduler_args);
   int device;
   cudaGetDevice(&device);
