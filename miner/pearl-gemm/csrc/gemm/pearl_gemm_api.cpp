@@ -2,6 +2,7 @@
 // of the torch headers.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/nn/functional.h>
 #include <torch/python.h>
@@ -23,6 +24,8 @@
 #include "../moe/build_routing_data.cuh"
 #include "../tensor_hash/tensor_hash_api.hpp"
 
+#include <array>
+#include <mutex>
 #include <optional>
 
 #include <iostream>
@@ -615,6 +618,25 @@ void gemm(at::Tensor& A,         // m x k
 done:;
 }
 
+// Fork/join events for running noising A on a side stream, created once per
+// device. Only recorded and waited on, so they are reusable under CUDA-graph
+// capture.
+static std::array<cudaEvent_t, 2> get_noising_fork_join_events(int device_id) {
+  static std::mutex mutex;
+  static std::array<std::array<cudaEvent_t, 2>, 64> events{};
+  static std::array<bool, 64> created{};
+  TORCH_CHECK(device_id >= 0 && device_id < 64, "Invalid device id");
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!created[device_id]) {
+    at::cuda::CUDAGuard device_guard{(char)device_id};
+    for (auto& event : events[device_id]) {
+      C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
+    created[device_id] = true;
+  }
+  return events[device_id];
+}
+
 void noisy_gemm(
     at::Tensor& A,                                  // m x k
     at::Tensor& B,                                  // n x k
@@ -869,6 +891,19 @@ void noisy_gemm(
   bool do_denoise_conversion =
       (int32_noising_EARxBpEB || int32_noising_AxEBL) && (!skip_denoising);
 
+  // Noising A and noising B write disjoint outputs, so when both run, noising A
+  // goes on a side stream forked from and joined back into the current stream
+  // before the denoise converter and the gemm.
+  bool overlap_noising = run_noising_a && run_noising_b;
+  cudaStream_t noising_a_stream = stream;
+  std::array<cudaEvent_t, 2> noising_events{};
+  if (overlap_noising) {
+    noising_a_stream =
+        at::cuda::getStreamFromPool(/*isHighPriority=*/false, A.get_device())
+            .stream();
+    noising_events = get_noising_fork_join_events(A.get_device());
+  }
+
   DEBUG_MODE_SWITCH(
       enable_debug, EnableDebug,
       SKIP_REDUCTION_SWITCH(
@@ -876,14 +911,25 @@ void noisy_gemm(
           SKIP_DENOISING_SWITCH(
               skip_denoising, SkipDenoising,
 
+              if (overlap_noising) {
+                C10_CUDA_CHECK(cudaEventRecord(noising_events[0], stream));
+                C10_CUDA_CHECK(cudaStreamWaitEvent(noising_a_stream,
+                                                   noising_events[0], 0));
+              }
+
               if (run_noising_a) {
                 NOISING_A_CONFIG_SWITCH(
                     tile_size_m_noising_A, tile_size_k_noising_A, r,
                     pipeline_stages_noising_A, AxEBL_noising_dtype,
                     kernel_found_noising_a = true;
                     run_pearl_noising_A_<ElementDenoise_AxEBL, R_, bM_, bK_,
-                                         stages_>(params, stream););
+                                         stages_>(params, noising_a_stream););
               } else { kernel_found_noising_a = true; }
+
+              if (overlap_noising) {
+                C10_CUDA_CHECK(
+                    cudaEventRecord(noising_events[1], noising_a_stream));
+              }
 
               if (run_noising_b) {
                 NOISING_B_CONFIG_SWITCH(
@@ -893,6 +939,11 @@ void noisy_gemm(
                     run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_,
                                          stages_>(params, stream););
               } else { kernel_found_noising_b = true; }
+
+              if (overlap_noising) {
+                C10_CUDA_CHECK(
+                    cudaStreamWaitEvent(stream, noising_events[1], 0));
+              }
 
               if (do_denoise_conversion) {
                 if (params.r == 64) {
