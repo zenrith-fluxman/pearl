@@ -90,7 +90,7 @@ def hash_weights(B, layer_key: int | None, key_tensor, scratchpad, k: int, noise
         return _WEIGHT_HASHES[cache_key]
 
     B_tensor_hash = torch.empty(32, device="cuda", dtype=torch.uint8)
-    tensor_hash(B.view(torch.uint8), key_tensor, B_tensor_hash, scratchpad)
+    tensor_hash(B.view(torch.uint8), key_tensor, B_tensor_hash, scratchpad, num_stages=4)
 
     if cache_key is not None:
         _WEIGHT_HASHES[cache_key] = B_tensor_hash
@@ -196,6 +196,7 @@ def pearl_gemm_noisy(
         key_tensor,
         A_tensor_hash,
         tensor_hash_scratchpad,
+        num_stages=4,
     )
 
     if layer_key is None and layer is not None:

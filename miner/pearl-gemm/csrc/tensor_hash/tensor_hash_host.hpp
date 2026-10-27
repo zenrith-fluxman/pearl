@@ -60,6 +60,39 @@ void launch_merkle_tree_roots(const uint8_t* data, uint32_t data_len,
   gpuErrchk(cudaGetLastError());
 }
 
+// Launch the MerkleTreeRootsKernel instantiation for the given configuration.
+// When the whole input fits in a single block, the roots kernel produces the
+// final digest and must apply BLAKE3's ROOT flag itself (kApplyRoot=true).
+// Dispatching on a compile-time flag keeps the common multi-block kernel
+// identical to the original (no ROOT) code path, so there is no slowdown.
+template <int kNumConsumerThreads, int kNumStages, int kThreadLoadSize>
+void dispatch_merkle_tree_roots(const uint8_t* data, uint32_t data_len,
+                                uint32_t num_blocks, uint8_t* roots,
+                                cudaStream_t stream) {
+  if (num_blocks == 1) {
+    launch_merkle_tree_roots<pearl::MerkleTreeRootsKernel<
+        kNumConsumerThreads, kNumStages, kThreadLoadSize, /*kApplyRoot=*/true>>(
+        data, data_len, roots, stream);
+  } else {
+    launch_merkle_tree_roots<
+        pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kNumStages,
+                                     kThreadLoadSize, /*kApplyRoot=*/false>>(
+        data, data_len, roots, stream);
+  }
+}
+
+// Wide-load configuration of merkle_tree_roots_kernel: each thread fetches its
+// 1 KiB chunk in two 512-byte TMA loads, and both loads are in flight at once
+// (kWideNumStages == loads per chunk, so more stages would never be used).
+// This cuts the per-stage consumer barrier + pipeline round trips from 8 to 2
+// per chunk. The bytes hashed, the chunk-to-thread mapping, the counters and
+// the flags are unchanged, so the result is bit-identical.
+constexpr int kWideThreadLoadSize = 512;
+constexpr int kWideNumStages = blake3::CHUNK_SIZE / kWideThreadLoadSize;
+constexpr uint32_t kWideMinDataSize = 1u << 20;
+// Max dynamic shared memory per block on SM90 (227 KiB).
+constexpr int kMaxSmemPerBlockSm90 = 227 * 1024;
+
 // kNumConsumerThreads: number of consumer threads for merkle_tree_roots_kernel
 // kNumStages: pipeline stages for merkle_tree_roots_kernel
 // kLeavesPerMTBlock: threads for compute_blake_mt_kernel
@@ -73,19 +106,33 @@ void tensor_hash_impl(const uint8_t* data, uint32_t data_size, uint8_t* out,
   set_key(key);
   const u32 data_len = data_size;
 
-  // When the whole input fits in a single block, the roots kernel produces the
-  // final digest and must apply BLAKE3's ROOT flag itself (kApplyRoot=true).
-  // Dispatching on a compile-time flag keeps the common multi-block kernel
-  // identical to the original (no ROOT) code path, so there is no slowdown.
-  if (num_blocks == 1) {
-    launch_merkle_tree_roots<pearl::MerkleTreeRootsKernel<
-        kNumConsumerThreads, kNumStages, kThreadLoadSize, /*kApplyRoot=*/true>>(
-        data, data_len, roots, stream);
-  } else {
-    launch_merkle_tree_roots<
-        pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kNumStages,
-                                     kThreadLoadSize, /*kApplyRoot=*/false>>(
-        data, data_len, roots, stream);
+  // Use the wide-load roots kernel for large, chunk-aligned inputs whose grid
+  // fits in one wave (the kernel uses >128 KiB of smem, i.e. one CTA per SM).
+  // It is only instantiated when its A staging buffer fits in shared memory
+  // (kNumConsumerThreads == 128: 128 KiB, plus 4 KiB of leaves).
+  constexpr bool kWideLoadsFit =
+      kNumConsumerThreads * kWideThreadLoadSize * kWideNumStages <
+      kMaxSmemPerBlockSm90;
+  bool launched = false;
+  if constexpr (kWideLoadsFit) {
+    using WideMerkleTreeRootsKernel =
+        pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kWideNumStages,
+                                     kWideThreadLoadSize, /*kApplyRoot=*/false>;
+    static_assert(WideMerkleTreeRootsKernel::SharedStorageSize <=
+                      kMaxSmemPerBlockSm90,
+                  "Wide-load merkle_tree_roots_kernel exceeds shared memory");
+    if (data_size % blake3::CHUNK_SIZE == 0 && data_size >= kWideMinDataSize &&
+        num_blocks <= static_cast<uint32_t>(deviceProp.multiProcessorCount)) {
+      dispatch_merkle_tree_roots<kNumConsumerThreads, kWideNumStages,
+                                 kWideThreadLoadSize>(data, data_len,
+                                                      num_blocks, roots, stream);
+      launched = true;
+    }
+  }
+  if (!launched) {
+    dispatch_merkle_tree_roots<kNumConsumerThreads, kNumStages,
+                               kThreadLoadSize>(data, data_len, num_blocks,
+                                                roots, stream);
   }
 
   // 4. Compute MT as per BLAKE structure on global
