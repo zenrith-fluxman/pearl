@@ -33,6 +33,25 @@ _LOGGER = get_logger("vllm.pearl_miner")
 
 
 
+# pearl_gemm_noisy does per-call host work (fetches the current mining job, key and target, uses a
+# pinned host-signal buffer, submits tickets). A CUDA graph replay skips all of that Python and would
+# mine with a stale job, key, target and buffer. Today vLLM captures graphs only for small batches,
+# below the mining row threshold, so this never fires; it turns a too-large capture size into a loud
+# failure at capture time instead of silently broken mining. Only called on the mining branch.
+def _raise_if_capturing_cuda_graph(m: int) -> None:
+    if not torch.cuda.is_current_stream_capturing():
+        return
+
+    min_m = config.matrix_multiplication_config["use_simplified_gemm"]["min_m"]
+    raise RuntimeError(
+        f"Pearl mining GEMM (m={m} rows) was called while a CUDA graph is being captured. "
+        "Mining must not run inside a captured CUDA graph: graph replays skip the per-call host work "
+        "and would reuse a stale mining job, key, target and signal buffer. Keep vLLM's cudagraph "
+        f"capture sizes (compilation_config.cudagraph_capture_sizes / max_cudagraph_capture_size) "
+        f"below the mining row threshold min_m={min_m}."
+    )
+
+
 # The Pearl linear (quantize, pick noisy or vanilla GEMM by size, multiply) as one opaque custom op.
 # torch.compile cannot trace the CuTe-DSL quantize kernel nor the size-dependent Python choice, so
 # without this vLLM can only run Pearl with --enforce-eager (no torch.compile, no CUDA graphs).
@@ -56,6 +75,8 @@ def _pearl_apply_linear(
     m, k, n = x_q.shape[0], x_q.shape[1], w_q.shape[0]
 
     if config.should_use_noisy_gemm(m, n, k) and not config.settings.no_mining:
+        _raise_if_capturing_cuda_graph(m)
+
         return pearl_gemm_noisy(
             x_q.contiguous(),
             w_q.contiguous(),
