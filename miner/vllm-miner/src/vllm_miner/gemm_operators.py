@@ -254,6 +254,9 @@ def pearl_gemm_noisy(
 
     pow_target_tensor = job_constants.pow_target_tensor
 
+    # 2x1 cluster: M-neighbour CTAs share (multicast) the B tile; only when m fills whole clusters
+    cluster_size_m = 2 if m % (2 * config.settings.tile_size_m) == 0 else 1
+
     # Run noisy GEMM with default kernel configurations
     noisy_gemm(
         A=A,  # Input matrix A (m x k)
@@ -282,6 +285,8 @@ def pearl_gemm_noisy(
         tile_size_m=config.settings.tile_size_m,
         tile_size_n=config.settings.tile_size_n,
         tile_size_k=config.settings.tile_size_k,
+        cluster_size_m=cluster_size_m,
+        cluster_size_n=1,
         run_noising_A=True,  # run_noising_A
         run_noising_B=True,  # run_noising_B
         skip_reduction=False,  # skip_reduction
