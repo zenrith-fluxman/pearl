@@ -282,6 +282,8 @@ def pearl_gemm_noisy(
         tile_size_m=config.settings.tile_size_m,
         tile_size_n=config.settings.tile_size_n,
         tile_size_k=config.settings.tile_size_k,
+        swizzle=max(1, -(-m // config.settings.tile_size_m)),  # all M tiles of an N column
+        swizzle_n_maj=False,  # M-major raster: B tiles read once, A stays in L2
         run_noising_A=True,  # run_noising_A
         run_noising_B=True,  # run_noising_B
         skip_reduction=False,  # skip_reduction
