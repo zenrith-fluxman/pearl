@@ -51,7 +51,7 @@ class NoisingKernelB {
   static constexpr uint32_t kActiveWarpGroups = 3;
   static constexpr uint32_t MaxThreadsPerBlock =
       kActiveWarpGroups * kNumThreadsPerWarpGroup;
-  static constexpr uint32_t MinBlocksPerMultiprocessor = R == 64 ? 2 : 1;
+  static constexpr uint32_t MinBlocksPerMultiprocessor = 2;
 
   static constexpr uint32_t kNumEARxBpEBThreads =
       kNumThreadsPerWarpGroup;                                          // 1 WG

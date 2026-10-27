@@ -50,7 +50,7 @@ class NoisingKernelA {
   static constexpr uint32_t kNumWarpGroups = 3;  // 1 producer, 2 consumers
   static constexpr uint32_t MaxThreadsPerBlock =
       kNumWarpGroups * kNumThreadsPerWarpGroup;
-  static constexpr uint32_t MinBlocksPerMultiprocessor = R == 64 ? 2 : 1;
+  static constexpr uint32_t MinBlocksPerMultiprocessor = 2;
 
   static constexpr uint32_t kNumAxEBLThreads = kNumThreadsPerWarpGroup;  // 1 WG
   static constexpr uint32_t kNumApEAThreads = kNumThreadsPerWarpGroup;   // 1 WG
