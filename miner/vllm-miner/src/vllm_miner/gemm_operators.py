@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 import torch
@@ -58,6 +59,51 @@ _JOB_CONSTANTS_FOR: list[tuple | None] = [None]
 # the current job, per layer. Only weights that come with their layer (vLLM's path) are cached:
 # the layer object pins their identity, so a freed-and-reused address can never hit the cache.
 _WEIGHT_HASHES: dict[tuple, torch.Tensor] = {}
+
+# get_host_signal_sync_size and get_required_scratchpad_bytes are pure; their results are kept.
+_HOST_SIGNAL_SYNC_SIZE: list[int | None] = [None]
+_SCRATCHPAD_BYTES: dict[int, int] = {}
+
+# Offsets of tensors carved from one shared allocation are aligned to this many bytes.
+_CARVE_ALIGNMENT = 256
+
+
+def get_host_signal_sync_size_cached() -> int:
+    if _HOST_SIGNAL_SYNC_SIZE[0] is None:
+        _HOST_SIGNAL_SYNC_SIZE[0] = get_host_signal_sync_size()
+
+    return _HOST_SIGNAL_SYNC_SIZE[0]
+
+
+def get_required_scratchpad_bytes_cached(matrix_bytes: int) -> int:
+    scratchpad_bytes = _SCRATCHPAD_BYTES.get(matrix_bytes)
+
+    if scratchpad_bytes is None:
+        scratchpad_bytes = get_required_scratchpad_bytes(matrix_bytes)
+        _SCRATCHPAD_BYTES[matrix_bytes] = scratchpad_bytes
+
+    return scratchpad_bytes
+
+
+def carve_tensors(specs: list[tuple[tuple[int, ...], torch.dtype, int]], device) -> list[torch.Tensor]:
+    """
+    Allocates contiguous tensors of the given (shape, dtype, bytes per element) as
+    non-overlapping slices of one uint8 buffer, each starting at a multiple of _CARVE_ALIGNMENT
+    bytes. The slices keep the buffer alive.
+    """
+    offsets = []
+    total_bytes = 0
+    for shape, _, element_bytes in specs:
+        offsets.append(total_bytes)
+        num_bytes = math.prod(shape) * element_bytes
+        total_bytes += -(-num_bytes // _CARVE_ALIGNMENT) * _CARVE_ALIGNMENT
+
+    buffer = torch.empty(total_bytes, dtype=torch.uint8, device=device)
+
+    return [
+        buffer[offset : offset + math.prod(shape) * element_bytes].view(dtype).view(shape)
+        for offset, (shape, dtype, element_bytes) in zip(offsets, specs)
+    ]
 
 
 def get_job_constants(mining_job, matmul_config, k: int, noise_rank: int) -> _JobConstants:
@@ -177,7 +223,7 @@ def pearl_gemm_noisy(
 
     matrix_bytes = max(m * k, n * k)
     tensor_hash_scratchpad = torch.empty(
-        get_required_scratchpad_bytes(matrix_bytes),
+        get_required_scratchpad_bytes_cached(matrix_bytes),
         dtype=torch.uint8,
         device=a.device,
     )
@@ -190,7 +236,11 @@ def pearl_gemm_noisy(
     job_constants = get_job_constants(mining_job, matmul_config, k, r)
     key_tensor = job_constants.key_tensor
 
-    A_tensor_hash = torch.empty(32, device="cuda", dtype=torch.uint8)
+    # The three 32-byte per-call hashes share one allocation
+    small_hashes = torch.empty(96, device="cuda", dtype=torch.uint8)
+    A_tensor_hash = small_hashes[0:32]
+    commitment_hash_A_tensor = small_hashes[32:64]
+    commitment_hash_B_tensor = small_hashes[64:96]
     tensor_hash(
         A.view(torch.uint8),
         key_tensor,
@@ -203,8 +253,6 @@ def pearl_gemm_noisy(
     B_tensor_hash = hash_weights(B, layer_key, key_tensor, tensor_hash_scratchpad, k, r)
 
     # Generate commitment hashes for noise generation.
-    commitment_hash_A_tensor = torch.empty(32, device="cuda", dtype=torch.uint8)
-    commitment_hash_B_tensor = torch.empty(32, device="cuda", dtype=torch.uint8)
     commitment_hash_from_merkle_roots(
         A_tensor_hash,
         B_tensor_hash,
@@ -214,8 +262,12 @@ def pearl_gemm_noisy(
         salted_dims=(m, n) if mining_job.cert_version.uses_salted_seeds else None,
     )
 
-    # int32 denoising factors let the noising kernels split K; noise_gen zeroes them
-    denoise_int32 = torch.empty((m + n) * r, dtype=torch.int32, device=a.device)
+    # int32 denoising factors let the noising kernels split K; host_signal_sync lives in the
+    # int32 words after them. noise_gen zeroes the whole buffer, so both arrive zeroed.
+    host_signal_sync_size = get_host_signal_sync_size_cached()
+    # Whole int32 words, rounded up to a multiple of 4 as noise_gen requires of the aux buffer
+    sync_words = -(-host_signal_sync_size // 16) * 4
+    denoise_int32 = torch.empty((m + n) * r + sync_words, dtype=torch.int32, device=a.device)
     AxEBL_int32 = denoise_int32[: m * r].view(m, r)
     EARxBpEB_int32 = denoise_int32[m * r :].view(n, r)
 
@@ -248,8 +300,7 @@ def pearl_gemm_noisy(
     ApEA = torch.empty((m, k), dtype=torch.int8, device=a.device)
     A_E_BL = torch.empty((m, r), dtype=torch.float16, device=a.device)
 
-    host_signal_sync_size = get_host_signal_sync_size()
-    host_signal_sync = torch.zeros((host_signal_sync_size,), dtype=torch.int8, device="cuda")
+    host_signal_sync = denoise_int32[(m + n) * r :].view(torch.int8)[:host_signal_sync_size]
     host_signal_header_pinned = get_pinned_pool().acquire()
 
     pow_target_tensor = job_constants.pow_target_tensor
@@ -329,6 +380,7 @@ def pearl_gemm_noisy(
     del EBR_fp16
     del key_tensor
     del A_tensor_hash
+    del small_hashes
     del B_tensor_hash
     del tensor_hash_scratchpad
     del host_signal_sync
@@ -375,15 +427,28 @@ def generate_noise_factors(
     :return: Tuple of noise tensors (EAL, EAR_R_major, EBL_R_major,
              EAR_K_major, EBL_K_major, EBR, EAL_fp16, EBR_fp16)
     """
-    EAL = torch.empty((m, r), dtype=torch.int8, device=device)
-    EBR = torch.empty((n, r), dtype=torch.int8, device=device)
-
-    EAR_R_major = torch.empty((k, r), dtype=torch.int8, device=device)
-    EBL_R_major = torch.empty((k, r), dtype=torch.int8, device=device)
-    EAR_K_major = torch.empty((r, k), dtype=torch.int8, device=device)
-    EBL_K_major = torch.empty((r, k), dtype=torch.int8, device=device)
-    EAL_fp16 = torch.empty((m, r), dtype=torch.float16, device=device)
-    EBR_fp16 = torch.empty((n, r), dtype=torch.float16, device=device)
+    (
+        EAL,
+        EBR,
+        EAR_R_major,
+        EBL_R_major,
+        EAR_K_major,
+        EBL_K_major,
+        EAL_fp16,
+        EBR_fp16,
+    ) = carve_tensors(
+        [
+            ((m, r), torch.int8, 1),
+            ((n, r), torch.int8, 1),
+            ((k, r), torch.int8, 1),
+            ((k, r), torch.int8, 1),
+            ((r, k), torch.int8, 1),
+            ((r, k), torch.int8, 1),
+            ((m, r), torch.float16, 2),
+            ((n, r), torch.float16, 2),
+        ],
+        device,
+    )
 
     noise_gen(
         R=r,
