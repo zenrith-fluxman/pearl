@@ -13,6 +13,7 @@
 #include "cutlass/epilogue/collective/builders/sm90_common.inl"
 #include "cutlass/gemm/collective/builders/sm90_common.inl"
 
+#include "denoise_converter_kernel.h"
 #include "named_barrier.hpp"
 #include "pearl_gemm_constants.hpp"
 #include "utils.h"
@@ -304,6 +305,7 @@ class NoisingKernelB {
       typename MainloopLoadPipeline::SharedStorage pipeline_EBL;
       typename MainloopStorePipeline::SharedStorage pipeline_BpEB_store;
       uint64_t EBR_mbar;
+      int is_last_split;  // split-K fixup: this CTA completed its EARxBpEB tile
     };
   };
 
@@ -323,6 +325,9 @@ class NoisingKernelB {
     int k;
     int num_k_blocks;  // k blocks per split
     int total_k_blocks;
+    // split-K fixup: if set, the last split converts EARxBpEB to fp16
+    int* const ptr_tile_counters;
+    half_t* const ptr_EARxBpEB_fp16;
   };
 
   // Kernel entry point API
@@ -339,6 +344,8 @@ class NoisingKernelB {
     int k;
     int num_k_blocks;  // k blocks per split
     int total_k_blocks;
+    int* const ptr_tile_counters;
+    half_t* const ptr_EARxBpEB_fp16;
     // Layouts for GMEM Tensors (needed for TMA partition)
     LayoutT layout_B;
     LayoutT layout_EAR;
@@ -359,6 +366,7 @@ class NoisingKernelB {
     S2RCopyBDone,
     R2SCopyEARxBpEBDone,
     EARxBpEBSMEMReady,
+    TileCounterDone,
   };
 
   // Convert to underlying arguments
@@ -420,6 +428,8 @@ class NoisingKernelB {
             .k = args.k,
             .num_k_blocks = args.num_k_blocks,
             .total_k_blocks = args.total_k_blocks,
+            .ptr_tile_counters = args.ptr_tile_counters,
+            .ptr_EARxBpEB_fp16 = args.ptr_EARxBpEB_fp16,
             .layout_B = layout_B,
             .layout_EAR = layout_EAR,
             .layout_EBR = layout_EBR,
@@ -769,6 +779,27 @@ class NoisingKernelB {
       cute::copy(params.tma_store_EARxBpEB, tOsEARxBpEB, tOgEARxBpEB);
       tma_store_arrive();
       tma_store_wait<0>();
+      if constexpr (!NoReduction) {
+        if (params.ptr_tile_counters != nullptr) {
+          shared_storage.is_last_split = arrive_noising_tile_counter(
+              &params.ptr_tile_counters[n_block], gridDim.y);
+        }
+      }
+    }
+
+    // Split-K fixup: the CTA completing the tile converts it to fp16
+    if constexpr (!NoReduction) {
+      if (params.ptr_tile_counters != nullptr) {
+        cutlass::arch::NamedBarrier::sync(
+            kNumEARxBpEBThreads,
+            static_cast<uint32_t>(NamedBarriers::TileCounterDone));
+        if (*reinterpret_cast<volatile int*>(&shared_storage.is_last_split)) {
+          __threadfence();
+          convert_denoise_tile<R, kBlockN, kNumEARxBpEBThreads>(
+              params.ptr_EARxBpEB, params.ptr_EARxBpEB_fp16, params.n,
+              pearl::kEARxBpEBScaleFactor, n_block, tid);
+        }
+      }
     }
   }
 

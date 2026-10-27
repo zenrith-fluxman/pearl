@@ -40,7 +40,10 @@ void run_pearl_noising_A(PearlAPIParams const& params,
       .k = params.k,
       .num_k_blocks =
           no_reduce ? total_k_blocks : params.k_blocks_per_split_noising_A,
-      .total_k_blocks = total_k_blocks};
+      .total_k_blocks = total_k_blocks,
+      .ptr_tile_counters =
+          params.fuse_denoise_conversion ? params.noising_counters_A : nullptr,
+      .ptr_AxEBL_fp16 = static_cast<half_t*>(params.ptr_AxEBL_mma)};
 
   typename NoisingKernelA::Params kernel_params =
       NoisingKernelA::to_underlying_arguments(args);

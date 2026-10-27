@@ -654,7 +654,10 @@ void noisy_gemm(
     bool run_noising_a = true, bool run_noising_b = true,
     bool skip_reduction = false, bool skip_denoising = false,
     std::optional<at::Tensor> inner_hash_counter = std::nullopt,
-    bool enable_debug = false) {
+    bool enable_debug = false,
+    // ceil(m / tile_size_m_noising_A) + ceil(n / tile_size_n_noising_B), int32,
+    // zeroed; lets split-K noising convert to fp16 without the converter kernel
+    std::optional<at::Tensor> noising_tile_counters = std::nullopt) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
 
   at::Tensor EAL_fp16, EBR_fp16, EAR_R_major, EBL_R_major, EAR_K_major,
@@ -871,6 +874,22 @@ void noisy_gemm(
 
   bool do_denoise_conversion =
       (int32_noising_EARxBpEB || int32_noising_AxEBL) && (!skip_denoising);
+
+  // The noising kernels' last splits convert both outputs to fp16 themselves
+  if (noising_tile_counters.has_value() && int32_noising_AxEBL &&
+      int32_noising_EARxBpEB && run_noising_a && run_noising_b &&
+      do_denoise_conversion) {
+    const int num_counters_A =
+        int((m + tile_size_m_noising_A - 1) / tile_size_m_noising_A);
+    const int num_counters_B =
+        int((n + tile_size_n_noising_B - 1) / tile_size_n_noising_B);
+    at::Tensor counters = noising_tile_counters.value();
+    check_tensor(counters, num_counters_A + num_counters_B, torch::kInt32);
+    params.noising_counters_A = static_cast<int*>(counters.data_ptr());
+    params.noising_counters_B = params.noising_counters_A + num_counters_A;
+    params.fuse_denoise_conversion = true;
+    do_denoise_conversion = false;
+  }
 
   DEBUG_MODE_SWITCH(
       enable_debug, EnableDebug,
@@ -1134,7 +1153,8 @@ TORCH_LIBRARY(pearl_gemm, m) {
       "    bool skip_reduction = True, "
       "    bool skip_denoising = False, "
       "    Tensor(inner_hash_counter!)? inner_hash_counter = None, "
-      "    bool enable_debug = False"
+      "    bool enable_debug = False, "
+      "    Tensor(noising_tile_counters!)? noising_tile_counters = None"
       ") -> ()",
       {at::Tag::pt2_compliant_tag});
 

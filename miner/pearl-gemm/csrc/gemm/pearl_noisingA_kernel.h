@@ -15,6 +15,7 @@
 #include "cutlass/epilogue/collective/builders/sm90_common.inl"
 #include "cutlass/gemm/collective/builders/sm90_common.inl"
 
+#include "denoise_converter_kernel.h"
 #include "pearl_gemm_constants.hpp"
 #include "utils.h"
 
@@ -291,6 +292,7 @@ class NoisingKernelA {
       typename MainloopLoadPipeline::SharedStorage pipeline_ear;
       typename MainloopStorePipeline::SharedStorage pipeline_apea;
       uint64_t eal_mbar;
+      int is_last_split;  // split-K fixup: this CTA completed its AxEBL tile
     };
   };
 
@@ -310,6 +312,9 @@ class NoisingKernelA {
     int k;
     int num_k_blocks;  // k blocks per split
     int total_k_blocks;
+    // split-K fixup: if set, the last split converts AxEBL to fp16
+    int* const ptr_tile_counters;
+    half_t* const ptr_AxEBL_fp16;
   };
 
   // Kernel entry point API
@@ -326,6 +331,8 @@ class NoisingKernelA {
     int k;
     int num_k_blocks;  // k blocks per split
     int total_k_blocks;
+    int* const ptr_tile_counters;
+    half_t* const ptr_AxEBL_fp16;
     // Layouts for GMEM Tensors (needed for TMA partition)
     LayoutT layout_A;
     LayoutT layout_EBL;
@@ -346,6 +353,7 @@ class NoisingKernelA {
     S2RCopyADone,
     R2SCopyAxEBLDone,
     AxEBLSMEMReady,
+    TileCounterDone,
   };
 
   // Convert to underlying arguments
@@ -403,6 +411,8 @@ class NoisingKernelA {
             .k = args.k,
             .num_k_blocks = args.num_k_blocks,
             .total_k_blocks = args.total_k_blocks,
+            .ptr_tile_counters = args.ptr_tile_counters,
+            .ptr_AxEBL_fp16 = args.ptr_AxEBL_fp16,
             .layout_A = layout_A,
             .layout_EBL = layout_EBL,
             .layout_EAL = layout_EAL,
@@ -742,6 +752,27 @@ class NoisingKernelA {
       cute::copy(params.tma_store_AxEBL, tOsAxEBL, tOgAxEBL);
       tma_store_arrive();
       tma_store_wait<0>();
+      if constexpr (!NoReduction) {
+        if (params.ptr_tile_counters != nullptr) {
+          shared_storage.is_last_split = arrive_noising_tile_counter(
+              &params.ptr_tile_counters[m_block], gridDim.y);
+        }
+      }
+    }
+
+    // Split-K fixup: the CTA completing the tile converts it to fp16
+    if constexpr (!NoReduction) {
+      if (params.ptr_tile_counters != nullptr) {
+        cutlass::arch::NamedBarrier::sync(
+            kNumAxEBLThreads,
+            static_cast<uint32_t>(NamedBarriers::TileCounterDone));
+        if (*reinterpret_cast<volatile int*>(&shared_storage.is_last_split)) {
+          __threadfence();
+          convert_denoise_tile<R, kBlockM, kNumAxEBLThreads>(
+              params.ptr_AxEBL, params.ptr_AxEBL_fp16, params.m,
+              pearl::kAxEBLScaleFactor, m_block, tid);
+        }
+      }
     }
   }
 

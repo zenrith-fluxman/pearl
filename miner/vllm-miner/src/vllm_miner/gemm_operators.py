@@ -214,10 +214,15 @@ def pearl_gemm_noisy(
         salted_dims=(m, n) if mining_job.cert_version.uses_salted_seeds else None,
     )
 
-    # int32 denoising factors let the noising kernels split K; noise_gen zeroes them
-    denoise_int32 = torch.empty((m + n) * r, dtype=torch.int32, device=a.device)
+    # int32 denoising factors let the noising kernels split K, followed by one
+    # counter per 64-row noising tile; noise_gen zeroes them all. The size is
+    # rounded up to the multiple of 4 ints that noise_gen's aux_buffer requires.
+    num_tile_counters = -(-m // 64) + -(-n // 64)
+    denoise_size = (m + n) * r + num_tile_counters
+    denoise_int32 = torch.empty(-(-denoise_size // 4) * 4, dtype=torch.int32, device=a.device)
     AxEBL_int32 = denoise_int32[: m * r].view(m, r)
-    EARxBpEB_int32 = denoise_int32[m * r :].view(n, r)
+    EARxBpEB_int32 = denoise_int32[m * r : (m + n) * r].view(n, r)
+    noising_tile_counters = denoise_int32[(m + n) * r : denoise_size]
 
     # Generate noise factors from commitment hashes
     (
@@ -286,6 +291,7 @@ def pearl_gemm_noisy(
         run_noising_B=True,  # run_noising_B
         skip_reduction=False,  # skip_reduction
         skip_denoising=False,  # skip_denoising
+        noising_tile_counters=noising_tile_counters,  # Last split converts to fp16
     )
 
     if submit_block:
@@ -335,6 +341,7 @@ def pearl_gemm_noisy(
     del EARxBpEB
     del AxEBL_int32
     del EARxBpEB_int32
+    del noising_tile_counters
     del denoise_int32
     return C
 

@@ -51,6 +51,12 @@ struct PearlAPIParams {
 
   // Launch with Programmatic Dependent Launch (set by noisy_gemm)
   bool use_pdl = false;
+
+  // Split-K noising fixup: per-tile counters (zeroed) let the last split of
+  //  each tile convert AxEBL / EARxBpEB to fp16, replacing the denoise converter
+  int* noising_counters_A = nullptr;
+  int* noising_counters_B = nullptr;
+  bool fuse_denoise_conversion = false;
 };
 
 struct Noise_gen_params {

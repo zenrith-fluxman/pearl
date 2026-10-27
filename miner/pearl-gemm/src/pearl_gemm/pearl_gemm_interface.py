@@ -368,6 +368,7 @@ def noisy_gemm(
     skip_denoising: bool = False,
     inner_hash_counter: torch.Tensor | None = None,
     enable_debug: bool = False,
+    noising_tile_counters: torch.Tensor | None = None,
 ):
     """Perform noising, matmul, and denoising.
 
@@ -445,6 +446,10 @@ def noisy_gemm(
         skip_denoising: Whether to disable the denoising epilogue.
         inner_hash_counter: Optional tensor to count inner hashes (for testing/debugging).
         enable_debug: If True, enables debug mode for inner hash counting validation.
+        noising_tile_counters (ceil(m / tile_size_m_noising_A) + ceil(n / tile_size_n_noising_B),
+            int32): Optional zeroed counters. When given with both int32 outputs and both
+            noising kernels run, the last split-K CTA of each noising tile converts it to
+            fp16 itself and the denoise converter kernel is not launched.
     """
     pearl_gemm_cuda.noisy_gemm(
         A,
@@ -492,6 +497,7 @@ def noisy_gemm(
         skip_denoising,
         inner_hash_counter,
         enable_debug,
+        noising_tile_counters,
     )
 
 
@@ -543,6 +549,7 @@ def _abstract_noisy_gemm(
     skip_denoising=False,
     inner_hash_counter=None,
     enable_debug=False,
+    noising_tile_counters=None,
 ):
     return None
 

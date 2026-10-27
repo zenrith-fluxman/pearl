@@ -148,4 +148,53 @@ class DenoiseConverterKernel {
     }
   }
 };
+
+// Split-K fixup used by the int32 noising kernels in place of a separate
+//  DenoiseConverterKernel launch. Called by the thread that issued the CTA's
+//  TMA reduce-add into a tile; returns true if this CTA completed the tile.
+CUTLASS_DEVICE bool arrive_noising_tile_counter(int* const counter,
+                                                const int num_splits) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  // Wait until the reduce-add has written global memory (not just read smem)
+  //  and order it before the generic-proxy counter increment
+  asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+#endif
+  __threadfence();
+  return atomicAdd(counter, 1) == num_splits - 1;
+}
+
+// Converts rows [block * kRows, (block + 1) * kRows) of a finished int32
+//  (num_rows x R) tile to fp16 with DenoiseConverterKernel's arithmetic.
+//  Reads bypass L1, since other CTAs reduced into the tile.
+template <int R, int kRows, int kNumThreads>
+CUTLASS_DEVICE void convert_denoise_tile(int32_t const* const ptr_in,
+                                         half_t* const ptr_out,
+                                         const int num_rows,
+                                         const int ScaleFactor, const int block,
+                                         const int tid) {
+  using ElementScale = float;
+  static constexpr int ValsPerThread = 4;
+  static constexpr int ThreadsPerRow = R / ValsPerThread;
+  static_assert(R % ValsPerThread == 0);
+  using StoreType = cutlass::AlignedArray<half_t, ValsPerThread>;
+
+  CUTLASS_PRAGMA_UNROLL
+  for (int idx = tid; idx < kRows * ThreadsPerRow; idx += kNumThreads) {
+    const int current_row = block * kRows + idx / ThreadsPerRow;
+    if (current_row < num_rows) {
+      const int64_t offset = static_cast<int64_t>(current_row) * R +
+                             (idx % ThreadsPerRow) * ValsPerThread;
+      const int4 in = __ldcg(reinterpret_cast<int4 const*>(ptr_in + offset));
+      const int32_t vals[ValsPerThread] = {in.x, in.y, in.z, in.w};
+      StoreType out;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < ValsPerThread; ++i) {
+        out[i] = static_cast<half_t>(static_cast<ElementScale>(vals[i]) /
+                                     static_cast<ElementScale>(ScaleFactor));
+      }
+      *reinterpret_cast<StoreType*>(ptr_out + offset) = out;
+    }
+  }
+}
 }  // namespace pearl
