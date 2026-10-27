@@ -281,6 +281,12 @@ struct CollectiveMainloop {
     HashAccumulator hash_accumulator(last_full_k_block,
                                      mainloop_params.inner_hash_counter);
 
+    // With two consumer warpgroups, alternate their WGMMA issue order per
+    // k-tile (ping-pong) so one warpgroup's MMAs overlap the other's drain and
+    // hash reduction. Only the issue order changes, not the math.
+    constexpr bool kOrderMma = KTraits::kNumMmaWarpgroups == 2;
+    int const mma_wg = thread_idx / cutlass::NumThreadsPerWarpGroup;
+
     CUTLASS_PRAGMA_NO_UNROLL
     for (int k_tile = 0; k_tile < k_tile_count; ++k_tile) {
       if constexpr (!SkipReduction) {
@@ -291,6 +297,16 @@ struct CollectiveMainloop {
       pipeline.consumer_wait(smem_pipe_read);
       auto stage = smem_pipe_read.index();
 
+      if constexpr (kOrderMma) {
+        if (mma_wg == 1 || k_tile > 0) {
+          cutlass::arch::NamedBarrier::sync(
+              kNumMmaThreads,
+              static_cast<cutlass::arch::ReservedNamedBarriers>(
+                  mma_wg == 0 ? pearl::NamedBarriers::MmaOrderWG0
+                              : pearl::NamedBarriers::MmaOrderWG1));
+        }
+      }
+
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < k_blocks_per_tile; ++k_block) {
         warpgroup_fence_operand(tCrC);
@@ -299,6 +315,23 @@ struct CollectiveMainloop {
         gemm(tiled_mma, tCrA(_, _, k_block, stage), tCrB(_, _, k_block, stage),
              tCrC);
         warpgroup_commit_batch();
+
+        if constexpr (kOrderMma) {
+          // Let the other warpgroup issue this (WG0) or the next (WG1) k-tile
+          if (k_block == k_blocks_per_tile - 1) {
+            if (mma_wg == 0) {
+              cutlass::arch::NamedBarrier::arrive(
+                  kNumMmaThreads,
+                  static_cast<cutlass::arch::ReservedNamedBarriers>(
+                      pearl::NamedBarriers::MmaOrderWG1));
+            } else if (k_tile < k_tile_count - 1) {
+              cutlass::arch::NamedBarrier::arrive(
+                  kNumMmaThreads,
+                  static_cast<cutlass::arch::ReservedNamedBarriers>(
+                      pearl::NamedBarriers::MmaOrderWG0));
+            }
+          }
+        }
 
         if constexpr (!SkipReduction) {
           hash_accumulator.accumulate(tCrC, k_block);
