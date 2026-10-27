@@ -951,6 +951,7 @@ class NoisingKernelB {
 
     // Wait for the previous grid before any global memory access
     wait_on_dependent_grids();
+    pdl_launch_dependents();
 
     if (warp_group_idx == 0) {  // Producer
       cutlass::arch::warpgroup_reg_dealloc<kNumLoadRegisters>();

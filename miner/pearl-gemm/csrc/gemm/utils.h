@@ -306,4 +306,13 @@ CUTLASS_DEVICE void wait_on_dependent_grids() {
 #endif
 }
 
+// Programmatic Dependent Launch: allow the next PDL-launched grid on the stream
+// to be scheduled early (it still blocks in griddepcontrol.wait until this grid
+// has completed). A no-op when there is no PDL dependent.
+CUTLASS_DEVICE void pdl_launch_dependents() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
 }  // namespace pearl

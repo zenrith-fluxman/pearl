@@ -137,6 +137,7 @@ class DenoiseConverterKernel {
 
     // Wait for the previous grid before any global memory access
     wait_on_dependent_grids();
+    pdl_launch_dependents();
 
     int bid = blockIdx.x;
 
