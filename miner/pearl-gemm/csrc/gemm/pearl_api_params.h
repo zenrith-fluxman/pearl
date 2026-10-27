@@ -48,6 +48,9 @@ struct PearlAPIParams {
   // PoW target and key (uint256, LE word order)
   void const* __restrict__ ptr_pow_target;  // uint32_t[8]
   void const* __restrict__ ptr_pow_key;     // uint32_t[8]
+
+  // Launch with Programmatic Dependent Launch (set by noisy_gemm)
+  bool use_pdl = false;
 };
 
 struct Noise_gen_params {

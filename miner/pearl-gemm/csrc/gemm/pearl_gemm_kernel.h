@@ -132,6 +132,9 @@ __global__ void __launch_bounds__(
     __syncthreads();
   }
 
+  // Wait for the previous grid before any global memory access
+  wait_on_dependent_grids();
+
   static_assert(KTraits::kNumWarps == 8 || KTraits::kNumWarps == 12 ||
                 KTraits::kNumWarps == 16 || KTraits::kNumWarps == 20);
   if (warp_group_idx == 0) {  // Producer

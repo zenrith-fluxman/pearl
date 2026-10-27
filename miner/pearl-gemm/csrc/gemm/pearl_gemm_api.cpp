@@ -856,6 +856,9 @@ void noisy_gemm(
   params.ptr_pow_target = pow_target.data_ptr();
   params.ptr_pow_key = pow_key.data_ptr();
 
+  // Overlap each kernel's launch and prologue with the previous kernel's tail
+  params.use_pdl = true;
+
   // Validate that inner_hash_counter is provided when enable_debug is true
   TORCH_CHECK(!enable_debug || params.inner_hash_counter != nullptr,
               "inner_hash_counter must be provided when enable_debug is True");

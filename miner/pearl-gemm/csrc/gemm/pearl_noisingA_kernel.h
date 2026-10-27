@@ -898,6 +898,9 @@ class NoisingKernelA {
     // Sync to ensure pipeline barrier init is visible across threads
     __syncthreads();
 
+    // Wait for the previous grid before any global memory access
+    wait_on_dependent_grids();
+
     if (warp_group_idx == 0) {  // Producer
       cutlass::arch::warpgroup_reg_dealloc<kNumLoadRegisters>();
 

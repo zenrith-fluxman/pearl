@@ -124,9 +124,18 @@ void run_pearl_gemm(PearlAPIParams const& params, cudaStream_t stream = 0) {
   dim3 block_dims(ctaSize);
   dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}),
                     size<2>(ClusterShape{}));
-  cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims,
-                                             cluster_dims, smem_size, stream};
-
-  cutlass::launch_kernel_on_cluster(launch_params, kernel, mainloop_params,
-                                    epilogue_params, scheduler_params);
+  // With use_pdl, this grid may launch while the previous one drains; the
+  // kernel waits on it (griddepcontrol.wait) before touching global memory.
+  cudaLaunchAttribute attrs[2];
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = cluster_dims.x;
+  attrs[0].val.clusterDim.y = cluster_dims.y;
+  attrs[0].val.clusterDim.z = cluster_dims.z;
+  attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[1].val.programmaticStreamSerializationAllowed = params.use_pdl;
+  cudaLaunchConfig_t config{grid_dims, block_dims,
+                            static_cast<size_t>(smem_size), stream, attrs, 2};
+  void* kernel_params[] = {&mainloop_params, &epilogue_params,
+                           &scheduler_params};
+  gpuErrchk(cudaLaunchKernelExC(&config, kernel, kernel_params));
 }

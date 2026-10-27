@@ -41,7 +41,13 @@ void run_denoise_converter(PearlAPIParams& params, cudaStream_t stream = 0) {
   constexpr static int smem_size =
       DenoiseConverterKernel::SharedStorageSize;  // 0, no smem used
   auto kernel = cutlass::device_kernel<DenoiseConverterKernel>;
-  kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
+  // With use_pdl, this grid may launch while the previous one drains; the
+  // kernel waits on it (griddepcontrol.wait) before touching global memory.
+  cudaLaunchAttribute attr;
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = params.use_pdl;
+  cudaLaunchConfig_t config{grid_dims, block_dims, smem_size, stream, &attr, 1};
+  gpuErrchk(cudaLaunchKernelEx(&config, kernel, kernel_params));
 
   CHECK_CUDA_KERNEL_LAUNCH();
 }

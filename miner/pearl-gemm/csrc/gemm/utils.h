@@ -298,4 +298,12 @@ CUTLASS_DEVICE void permute_Aregs_fp8(Fragment& frag) {
   }
 }
 
+// Programmatic Dependent Launch: block until the preceding grid on the stream
+// has completed and its memory is visible. A no-op when launched without PDL.
+CUTLASS_DEVICE void wait_on_dependent_grids() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
 }  // namespace pearl

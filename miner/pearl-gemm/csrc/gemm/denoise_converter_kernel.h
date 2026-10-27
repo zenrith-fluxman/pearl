@@ -135,6 +135,9 @@ class DenoiseConverterKernel {
 
   CUTLASS_DEVICE void operator()(Params const& params, char* smem_buf) {
 
+    // Wait for the previous grid before any global memory access
+    wait_on_dependent_grids();
+
     int bid = blockIdx.x;
 
     if (bid < params.num_m_blocks) {

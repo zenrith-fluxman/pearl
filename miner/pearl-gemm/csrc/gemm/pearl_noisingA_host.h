@@ -54,6 +54,12 @@ void run_pearl_noising_A(PearlAPIParams const& params,
     gpuErrchk(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   }
-  kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
+  // With use_pdl, this grid may launch while the previous one drains; the
+  // kernel waits on it (griddepcontrol.wait) before touching global memory.
+  cudaLaunchAttribute attr;
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = params.use_pdl;
+  cudaLaunchConfig_t config{grid_dims, block_dims, smem_size, stream, &attr, 1};
+  gpuErrchk(cudaLaunchKernelEx(&config, kernel, kernel_params));
   CHECK_CUDA_KERNEL_LAUNCH();
 }
